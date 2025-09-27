@@ -1,0 +1,9 @@
+
+aiohttp
+async-timeout
+beautifulsoup4
+pandas
+tldextract
+python-dateutil
+pdfminer.six
+fitz
