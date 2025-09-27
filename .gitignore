@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 results/pdfs/
+models/
 # C extensions
 *.so
 
