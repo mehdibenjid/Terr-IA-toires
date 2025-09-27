@@ -10,10 +10,10 @@ Scraper + PDF analyzer for French territorial documents (PCAET, PLU, SCOT, SRADE
 - CSV output + local PDF archive
 
 Quick start (demo Toulouse):
-    python scraper_territoires.py --demo --out results/occitanie.csv
+    python scraper_territoires.py --demo --year 2025 --collect-unknown --out results/occitanie.csv
 
 With your own CSV:
-    python scraper_territoires.py --input targets.csv --region Occitanie --out results/occitanie.csv
+    python scraper_territoires.py --input targets.csv --region Occitanie --year 2025 --collect-unknown --out results/occitanie.csv
 """
 
 import asyncio
@@ -26,7 +26,7 @@ import re
 import sys
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
 from datetime import datetime
 import pandas as pd
@@ -47,14 +47,14 @@ except Exception:
     HAS_PDFMINER = False
 
 if not (HAS_PYMUPDF or HAS_PDFMINER):
-    print("[FATAL] You need at least one PDF backend: install 'pymupdf' or 'pdfminer.six'.")
+    print("[FATAL] Need at least one PDF backend: install 'pymupdf' or 'pdfminer.six'.")
     sys.exit(1)
 
 # ---------------------------
 # CONFIG
 # ---------------------------
 
-USER_AGENT = "Mozilla/5.0 (compatible; territorial-scraper/2.1; +https://example.org/oss)"
+USER_AGENT = "Mozilla/5.0 (compatible; territorial-scraper/2.2; +https://example.org/oss)"
 PDF_EXT = (".pdf",)
 
 DOC_TYPES: Dict[str, List[str]] = {
@@ -112,7 +112,6 @@ class PDFAnalyzer:
         max_pages only applies to PyMuPDF (for speed).
         """
         if HAS_PYMUPDF:
-            # PyMuPDF path
             text_parts: List[str] = []
             doc = fitz.open(pdf_path)
             try:
@@ -124,7 +123,6 @@ class PDFAnalyzer:
                 doc.close()
             return "\n".join(text_parts)
         else:
-            # pdfminer.six
             return pdfminer_extract_text(pdf_path)
 
     @staticmethod
@@ -134,7 +132,6 @@ class PDFAnalyzer:
             text = PDFAnalyzer.extract_text_from_path(pdf_path).lower()
             for cat, mots in PARTIES_PRENANTES.items():
                 for mot in mots:
-                    # simple count; could be improved w/ tokenization
                     scores[cat] += len(re.findall(re.escape(mot.lower()), text))
         except Exception as e:
             print(f"[ERREUR] extraction {pdf_path}: {e}")
@@ -153,6 +150,7 @@ class Scraper:
         max_depth: int = 2,
         max_pages: int = 80,
         insecure_ssl: bool = False,
+        only_year: Optional[int] = None,
     ):
         self.targets = targets
         self.results: List[FoundDoc] = []
@@ -161,11 +159,11 @@ class Scraper:
         self.max_depth = int(max_depth)
         self.max_pages = int(max_pages)
         self.insecure_ssl = bool(insecure_ssl)
+        self.only_year = only_year
         os.makedirs(self.out_dir, exist_ok=True)
 
     @staticmethod
     def _is_pdf_url(url: str) -> bool:
-        # check by path (ignore query/fragment)
         path = urlparse(url).path.lower()
         return path.endswith(".pdf")
 
@@ -176,6 +174,25 @@ class Scraper:
                 if pat.search(text_for_match):
                     return label
         return None
+
+    @staticmethod
+    def _url_has_year(url: str, year: int) -> bool:
+        path = urlparse(url).path
+        return str(year) in path
+
+    @staticmethod
+    def _target_filename_from_url(url: str) -> str:
+        """
+        Use the last path segment as filename; decode %xx; sanitize for Windows.
+        Fallback to hashed name if empty; ensure .pdf.
+        """
+        path = urlparse(url).path
+        name = unquote(os.path.basename(path)) or ""
+        name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+        if not name.lower().endswith(".pdf"):
+            base = name or hashlib.md5(url.encode()).hexdigest()
+            name = f"{base}.pdf"
+        return name
 
     async def crawl_target(self, session: aiohttp.ClientSession, t: Target):
         base = t.base_url.rstrip("/") + "/"
@@ -200,18 +217,20 @@ class Scraper:
             soup = BeautifulSoup(html, "html.parser")
 
             # 1) Extract direct PDF links on this page
-            pdf_found_here = 0
             for a in soup.find_all("a", href=True):
                 href = a["href"].strip()
                 full = urljoin(url, href)
                 if not self._is_pdf_url(full):
                     continue
 
+                # Year filter (keep only URLs whose PATH contains that year)
+                if self.only_year is not None and not self._url_has_year(full, self.only_year):
+                    continue
+
                 anchor_text = a.get_text(" ") or ""
                 text_for_match = f"{anchor_text} {full}"
                 doc_type = self._classify_pdf(text_for_match)
                 if not doc_type and not self.collect_unknown:
-                    # skip unclassified unless explicitly allowed
                     continue
                 if not doc_type and self.collect_unknown:
                     doc_type = "UNKNOWN"
@@ -231,7 +250,6 @@ class Scraper:
                             parties_score=parties_score,
                         )
                     )
-                    pdf_found_here += 1
 
             # 2) Enqueue internal links for deeper crawl
             for a in soup.find_all("a", href=True):
@@ -240,7 +258,6 @@ class Scraper:
                 if not nxt.startswith(domain):
                     continue
                 if self._is_pdf_url(nxt):
-                    # already handled above
                     continue
                 if nxt.startswith(("mailto:", "tel:")):
                     continue
@@ -256,9 +273,7 @@ class Scraper:
                     allow_redirects=True,
                 ) as resp:
                     if resp.status == 200:
-                        # ignore decode errors; most sites are UTF-8
                         return await resp.text(errors="ignore")
-                    # simple visibility
                     if resp.status in (403, 404):
                         print(f"[{resp.status}] {url}")
         except Exception as e:
@@ -267,10 +282,13 @@ class Scraper:
 
     async def download_pdf(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
         try:
-            filename = hashlib.md5(url.encode()).hexdigest() + ".pdf"
+            filename = self._target_filename_from_url(url)   # ORIGINAL NAME
             path = os.path.join(self.out_dir, filename)
+
+            # If same name already exists, avoid accidental overwrite with different file
             if os.path.exists(path):
                 return path
+
             async with async_timeout.timeout(40):
                 async with session.get(
                     url,
@@ -281,7 +299,7 @@ class Scraper:
                         content = await resp.read()
                         with open(path, "wb") as f:
                             f.write(content)
-                        print(f"[OK] PDF: {url}")
+                        print(f"[OK] PDF: {url}  ->  {filename}")
                         return path
                     else:
                         print(f"[{resp.status}] PDF fail: {url}")
@@ -327,13 +345,13 @@ def read_targets(csv_path: str, departement=None, region=None) -> List[Target]:
 
 def save_results_csv(out_path: str, docs: List[FoundDoc]):
     df = pd.DataFrame([asdict(d) for d in docs])
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True
+    )
     df.to_csv(out_path, index=False, encoding="utf-8")
     print(f"[DONE] {len(df)} documents saved -> {out_path}")
 
 def demo_targets() -> List[Target]:
-    # Hand-picked entry points that actually lead to PDFs for Toulouse
-    # You can add/remove as needed.
+    # Pages that actually lead to PDFs around Toulouse
     return [
         Target("Toulouse Métropole – Accueil", "metropole", "https://metropole.toulouse.fr/"),
         Target("Toulouse Métropole – PLUi-H", "metropole", "https://metropole.toulouse.fr/mon-environnement/logement-et-urbanisme/urbanisme/le-plui-h"),
@@ -360,10 +378,11 @@ def main():
     p.add_argument("--collect-unknown", action="store_true", help="Also collect PDFs with unknown type")
     p.add_argument("--insecure-ssl", action="store_true", help="Disable SSL verification in connector")
     p.add_argument("--demo", action="store_true", help="Use built-in Toulouse targets (no CSV needed)")
+    p.add_argument("--year", type=int, help="Only collect PDFs whose URL path contains this year (e.g., 2025)")
     args = p.parse_args()
 
     if args.demo and args.input:
-        print("[WARN] You provided --demo and --input; demo will be used and input ignored.")
+        print("[WARN] --demo and --input provided; using demo, ignoring input.")
 
     if args.demo:
         targets = demo_targets()
@@ -384,6 +403,7 @@ def main():
         max_depth=args.max_depth,
         max_pages=args.max_pages,
         insecure_ssl=args.insecure_ssl,
+        only_year=args.year,
     )
     docs = asyncio.run(scraper.run())
     save_results_csv(args.out, docs)
