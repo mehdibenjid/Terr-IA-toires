@@ -1,8 +1,4 @@
-Bon, tu veux ton README en français et un petit speech d’ascenseur d’une minute. Voilà :
-
----
-
-# 🗂️ Extraction et analyse sémantique de PDFs territoriaux
+# Extraction et analyse sémantique de PDFs territoriaux
 
 Outils pour :
 
